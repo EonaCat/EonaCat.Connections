@@ -1,0 +1,41 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net48; net8.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Title>EonaCat.Connections</Title>
+    <Company>EonaCat (Jeroen Saey)</Company>
+    <Copyright>EonaCat (Jeroen Saey)</Copyright>
+    <PackageReadmeFile>readme.md</PackageReadmeFile>
+    <PackageId>EonaCat.Connections</PackageId>
+    <Version>1.0.4</Version>
+    <Authors>EonaCat (Jeroen Saey)</Authors>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageIcon>EonaCat.png</PackageIcon>
+    <PackageProjectUrl>https://git.saey.me/EonaCat/EonaCat.Connections</PackageProjectUrl>
+    <RepositoryUrl>https://git.saey.me/EonaCat/EonaCat.Connections</RepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\EonaCat.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\LICENSE">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\readme.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="EonaCat.Json" Version="1.1.9" />
+  </ItemGroup>
+
+</Project>

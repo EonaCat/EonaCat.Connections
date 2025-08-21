@@ -1,0 +1,13 @@
+﻿namespace EonaCat.Connections.EventArguments
+{
+    // This file is part of the EonaCat project(s) which is released under the Apache License.
+    // See the LICENSE file or go to https://EonaCat.com/license for full license details.
+
+    public class ErrorEventArgs : EventArgs
+    {
+        public string ClientId { get; set; }
+        public Exception Exception { get; set; }
+        public string Message { get; set; }
+        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+    }
+}
