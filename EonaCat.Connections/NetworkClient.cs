@@ -14,7 +14,7 @@ namespace EonaCat.Connections
     // This file is part of the EonaCat project(s) which is released under the Apache License.
     // See the LICENSE file or go to https://EonaCat.com/license for full license details.
 
-    public class NetworkClient
+    public class NetworkClient : IDisposable
     {
         private readonly Configuration _config;
         private TcpClient _tcpClient;
@@ -24,6 +24,9 @@ namespace EonaCat.Connections
         private CancellationTokenSource _cancellation;
         private bool _isConnected;
 
+        public bool IsConnected => _isConnected;
+        public bool IsAutoReconnecting { get; private set; }
+
         public event EventHandler<ConnectionEventArgs> OnConnected;
         public event EventHandler<DataReceivedEventArgs> OnDataReceived;
         public event EventHandler<ConnectionEventArgs> OnDisconnected;
@@ -31,13 +34,14 @@ namespace EonaCat.Connections
         public event EventHandler<ErrorEventArgs> OnEncryptionError;
         public event EventHandler<ErrorEventArgs> OnGeneralError;
 
-        public NetworkClient(Configuration config)
-        {
-            _config = config;
-        }
+        public string IpAddress => _config?.Host ?? string.Empty;
+        public int Port => _config?.Port ?? 0;
+
+        public NetworkClient(Configuration config) => _config = config;
 
         public async Task ConnectAsync()
         {
+            _cancellation?.Cancel();
             _cancellation = new CancellationTokenSource();
 
             if (_config.Protocol == ProtocolType.TCP)
@@ -46,7 +50,7 @@ namespace EonaCat.Connections
             }
             else
             {
-                await ConnectUdp();
+                await ConnectUdpAsync();
             }
         }
 
@@ -59,12 +63,11 @@ namespace EonaCat.Connections
 
                 Stream stream = _tcpClient.GetStream();
 
-                // Setup SSL if required
                 if (_config.UseSsl)
                 {
                     try
                     {
-                        var sslStream = new SslStream(stream, false, userCertificateValidationCallback: _config.GetRemoteCertificateValidationCallback());
+                        var sslStream = new SslStream(stream, false, _config.GetRemoteCertificateValidationCallback());
                         if (_config.Certificate != null)
                         {
                             sslStream.AuthenticateAsClient(_config.Host, new X509CertificateCollection { _config.Certificate }, _config.CheckCertificateRevocation);
@@ -73,6 +76,7 @@ namespace EonaCat.Connections
                         {
                             sslStream.AuthenticateAsClient(_config.Host);
                         }
+
                         stream = sslStream;
                     }
                     catch (Exception ex)
@@ -82,7 +86,6 @@ namespace EonaCat.Connections
                     }
                 }
 
-                // Setup AES encryption if required
                 if (_config.UseAesEncryption)
                 {
                     try
@@ -101,43 +104,38 @@ namespace EonaCat.Connections
 
                 OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self", RemoteEndPoint = new IPEndPoint(IPAddress.Parse(_config.Host), _config.Port) });
 
-                // Start receiving data
-                _ = Task.Run(() => ReceiveDataAsync(), _cancellation.Token);
+                _ = Task.Run(() => ReceiveDataAsync(_cancellation.Token), _cancellation.Token);
             }
             catch (Exception ex)
             {
+                _isConnected = false;
                 OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Failed to connect" });
+                _ = Task.Run(() => AutoReconnectAsync());
             }
         }
 
-        public string IpAddress => _config != null ? _config.Host : string.Empty;
-        public int Port => _config != null ? _config.Port : 0;
-        private async Task ConnectUdp()
+        private async Task ConnectUdpAsync()
         {
-            await Task.Run(() =>
+            try
             {
-                try
-                {
-                    _udpClient = new UdpClient();
-                    _udpClient.Connect(_config.Host, _config.Port);
-                    _isConnected = true;
+                _udpClient = new UdpClient();
+                _udpClient.Connect(_config.Host, _config.Port);
+                _isConnected = true;
 
-                    OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self", RemoteEndPoint = new IPEndPoint(IPAddress.Parse(_config.Host), _config.Port) });
+                OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self", RemoteEndPoint = new IPEndPoint(IPAddress.Parse(_config.Host), _config.Port) });
 
-                    // Start receiving data
-                    _ = Task.Run(() => ReceiveUdpDataAsync(), _cancellation.Token);
-                }
-                catch (Exception ex)
-                {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Failed to connect UDP" });
-                }
-            });
+                _ = Task.Run(() => ReceiveUdpDataAsync(_cancellation.Token), _cancellation.Token);
+            }
+            catch (Exception ex)
+            {
+                _isConnected = false;
+                OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Failed to connect UDP" });
+            }
         }
 
-
-        private async Task ReceiveDataAsync()
+        private async Task ReceiveDataAsync(CancellationToken ct)
         {
-            while (!_cancellation.Token.IsCancellationRequested && _isConnected)
+            while (!ct.IsCancellationRequested && _isConnected)
             {
                 try
                 {
@@ -145,10 +143,8 @@ namespace EonaCat.Connections
 
                     if (_config.UseAesEncryption && _aesEncryption != null)
                     {
-                        // Read 4-byte length prefix
                         var lengthBuffer = new byte[4];
-                        int read = await ReadExactAsync(_stream, lengthBuffer, 4, _cancellation.Token);
-                        if (read == 0)
+                        if (await ReadExactAsync(_stream, lengthBuffer, 4, ct) == 0)
                         {
                             break;
                         }
@@ -160,15 +156,15 @@ namespace EonaCat.Connections
 
                         int length = BitConverter.ToInt32(lengthBuffer, 0);
 
-                        // Read encrypted payload
                         var encrypted = new byte[length];
-                        await ReadExactAsync(_stream, encrypted, length, _cancellation.Token);
-                        data = await DecryptDataAsync(encrypted, _aesEncryption);
+                        await ReadExactAsync(_stream, encrypted, length, ct);
+
+                        data = await AesCryptoHelpers.DecryptDataAsync(encrypted, _aesEncryption);
                     }
                     else
                     {
                         data = new byte[_config.BufferSize];
-                        int bytesRead = await _stream.ReadAsync(data, 0, data.Length, _cancellation.Token);
+                        int bytesRead = await _stream.ReadAsync(data, 0, data.Length, ct);
                         if (bytesRead == 0)
                         {
                             break;
@@ -186,9 +182,8 @@ namespace EonaCat.Connections
                 }
                 catch (Exception ex)
                 {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving data" });
                     _isConnected = false;
-
+                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving data" });
                     _ = Task.Run(() => AutoReconnectAsync());
                     break;
                 }
@@ -196,7 +191,6 @@ namespace EonaCat.Connections
 
             await DisconnectAsync();
         }
-
 
         private async Task<int> ReadExactAsync(Stream stream, byte[] buffer, int length, CancellationToken ct)
         {
@@ -214,10 +208,9 @@ namespace EonaCat.Connections
             return offset;
         }
 
-
-        private async Task ReceiveUdpDataAsync()
+        private async Task ReceiveUdpDataAsync(CancellationToken ct)
         {
-            while (!_cancellation.Token.IsCancellationRequested && _isConnected)
+            while (!ct.IsCancellationRequested && _isConnected)
             {
                 try
                 {
@@ -226,10 +219,8 @@ namespace EonaCat.Connections
                 }
                 catch (Exception ex)
                 {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving data" });
+                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving UDP data" });
                     _isConnected = false;
-
-                    // Start reconnect
                     _ = Task.Run(() => AutoReconnectAsync());
                     break;
                 }
@@ -238,51 +229,32 @@ namespace EonaCat.Connections
 
         private async Task ProcessReceivedDataAsync(byte[] data)
         {
-            await Task.Run(() =>
+            try
             {
+                string stringData = null;
+                bool isBinary = true;
+
                 try
                 {
-                    // Data is already decrypted if AES is enabled
-                    // Just update stats / handle string conversion
-
-                    bool isBinary = true;
-                    string stringData = null;
-
-                    try
-                    {
-                        stringData = Encoding.UTF8.GetString(data);
-                        if (Encoding.UTF8.GetBytes(stringData).Length == data.Length)
-                        {
-                            isBinary = false;
-                        }
-                    }
-                    catch
-                    {
-                        // Keep as binary
-                    }
-
-                    OnDataReceived?.Invoke(this, new DataReceivedEventArgs
-                    {
-                        ClientId = "server",
-                        Data = data,
-                        StringData = stringData,
-                        IsBinary = isBinary
-                    });
+                    stringData = Encoding.UTF8.GetString(data);
+                    isBinary = Encoding.UTF8.GetBytes(stringData).Length != data.Length;
                 }
-                catch (Exception ex)
+                catch { }
+
+                OnDataReceived?.Invoke(this, new DataReceivedEventArgs
                 {
-                    if (_config.UseAesEncryption)
-                    {
-                        OnEncryptionError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error processing data" });
-                    }
-                    else
-                    {
-                        OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error processing data" });
-                    }
-                }
-            });
+                    ClientId = "server",
+                    Data = data,
+                    StringData = stringData,
+                    IsBinary = isBinary
+                });
+            }
+            catch (Exception ex)
+            {
+                var handler = _config.UseAesEncryption ? OnEncryptionError : OnGeneralError;
+                handler?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error processing data" });
+            }
         }
-
 
         public async Task SendAsync(byte[] data)
         {
@@ -295,10 +267,8 @@ namespace EonaCat.Connections
             {
                 if (_config.UseAesEncryption && _aesEncryption != null)
                 {
-                    // Encrypt payload
-                    data = await EncryptDataAsync(data, _aesEncryption);
+                    data = await AesCryptoHelpers.EncryptDataAsync(data, _aesEncryption);
 
-                    // Prepend 4-byte length for framing
                     var lengthPrefix = BitConverter.GetBytes(data.Length);
                     if (BitConverter.IsLittleEndian)
                     {
@@ -308,7 +278,6 @@ namespace EonaCat.Connections
                     var framed = new byte[lengthPrefix.Length + data.Length];
                     Buffer.BlockCopy(lengthPrefix, 0, framed, 0, lengthPrefix.Length);
                     Buffer.BlockCopy(data, 0, framed, lengthPrefix.Length, data.Length);
-
                     data = framed;
                 }
 
@@ -324,55 +293,17 @@ namespace EonaCat.Connections
             }
             catch (Exception ex)
             {
-                if (_config.UseAesEncryption)
-                {
-                    OnEncryptionError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error encrypting/sending data" });
-                }
-                else
-                {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error sending data" });
-                }
+                var handler = _config.UseAesEncryption ? OnEncryptionError : OnGeneralError;
+                handler?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error sending data" });
             }
         }
 
-
-        public async Task SendAsync(string message)
-        {
-            await SendAsync(Encoding.UTF8.GetBytes(message));
-        }
-
-        public async Task SendNicknameAsync(string nickname)
-        {
-            await SendAsync($"NICKNAME:{nickname}");
-        }
-
-        private async Task<byte[]> EncryptDataAsync(byte[] data, Aes aes)
-        {
-            using (var encryptor = aes.CreateEncryptor())
-            using (var ms = new MemoryStream())
-            using (var cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
-            {
-                await cs.WriteAsync(data, 0, data.Length);
-                cs.FlushFinalBlock();
-                return ms.ToArray();
-            }
-        }
-
-        private async Task<byte[]> DecryptDataAsync(byte[] data, Aes aes)
-        {
-            using (var decryptor = aes.CreateDecryptor())
-            using (var ms = new MemoryStream(data))
-            using (var cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read))
-            using (var result = new MemoryStream())
-            {
-                await cs.CopyToAsync(result);
-                return result.ToArray();
-            }
-        }
+        public async Task SendAsync(string message) => await SendAsync(Encoding.UTF8.GetBytes(message));
+        public async Task SendNicknameAsync(string nickname) => await SendAsync($"NICKNAME:{nickname}");
 
         private async Task AutoReconnectAsync()
         {
-            if (!_config.EnableAutoReconnect)
+            if (!_config.EnableAutoReconnect || IsAutoReconnecting)
             {
                 return;
             }
@@ -384,19 +315,17 @@ namespace EonaCat.Connections
                 attempt++;
                 try
                 {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Attempting to reconnect (Attempt {attempt})" });
+                    IsAutoReconnecting = true;
+                    OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Reconnecting attempt {attempt}" });
                     await ConnectAsync();
-
                     if (_isConnected)
                     {
-                        OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Reconnected successfully after {attempt} attempt(s)" });
+                        IsAutoReconnecting = false;
+                        OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Reconnected after {attempt} attempt(s)" });
                         break;
                     }
                 }
-                catch
-                {
-                    // Do nothing
-                }
+                catch { }
 
                 await Task.Delay(_config.ReconnectDelayMs);
             }
@@ -407,26 +336,22 @@ namespace EonaCat.Connections
             }
         }
 
-
         public async Task DisconnectAsync()
         {
-            await Task.Run(() =>
-            {
-                _isConnected = false;
-                _cancellation?.Cancel();
-                _tcpClient?.Close();
-                _udpClient?.Close();
-                _stream?.Dispose();
-                _aesEncryption?.Dispose();
+            _isConnected = false;
+            _cancellation?.Cancel();
 
-                OnDisconnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self" });
+            _tcpClient?.Close();
+            _udpClient?.Close();
+            _stream?.Dispose();
+            _aesEncryption?.Dispose();
 
-                _ = Task.Run(() => AutoReconnectAsync());
-            });
+            OnDisconnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self" });
         }
 
         public void Dispose()
         {
+            _cancellation?.Cancel();
             DisconnectAsync().Wait();
             _cancellation?.Dispose();
         }

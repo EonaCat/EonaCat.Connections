@@ -15,8 +15,17 @@ namespace EonaCat.Connections.Client.Example
 
             while (true)
             {
+                if (!_client.IsConnected)
+                {
+                    await Task.Delay(1000).ConfigureAwait(false);
+                    continue;
+                }
+
                 Console.Write("Enter message to send (or 'exit' to quit): ");
                 var message = Console.ReadLine();
+
+                HttpClient httpClient = new HttpClient();
+                message = await httpClient.GetStringAsync("https://samples.json-format.com/employees/10-level/employees-10-level_100MB.json");
 
                 if (!string.IsNullOrEmpty(message) && message.Equals("exit", StringComparison.OrdinalIgnoreCase))
                 {
@@ -46,10 +55,19 @@ namespace EonaCat.Connections.Client.Example
 
             _client = new NetworkClient(config);
 
+            _client.OnGeneralError += (sender, e) =>
+                Console.WriteLine($"Error: {e.Message}");
+
             // Subscribe to events
-            _client.OnConnected += (sender, e) =>
+            _client.OnConnected += async (sender, e) =>
             {
                 Console.WriteLine($"Connected to server at {e.RemoteEndPoint}");
+
+                // Send nickname
+                await _client.SendNicknameAsync("TestUser");
+
+                // Send a message
+                await _client.SendAsync("Hello server!");
             };
 
             _client.OnDataReceived += (sender, e) =>
@@ -60,13 +78,8 @@ namespace EonaCat.Connections.Client.Example
                 Console.WriteLine("Disconnected from server");
             };
 
+            Console.WriteLine("Connecting to server...");
             await _client.ConnectAsync();
-
-            // Send nickname
-            await _client.SendNicknameAsync("TestUser");
-
-            // Send a message
-            await _client.SendAsync("Hello server!");
         }
     }
 }
