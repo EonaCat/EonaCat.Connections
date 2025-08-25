@@ -24,9 +24,6 @@ namespace EonaCat.Connections.Client.Example
                 Console.Write("Enter message to send (or 'exit' to quit): ");
                 var message = Console.ReadLine();
 
-                HttpClient httpClient = new HttpClient();
-                message = await httpClient.GetStringAsync("https://samples.json-format.com/employees/10-level/employees-10-level_100MB.json");
-
                 if (!string.IsNullOrEmpty(message) && message.Equals("exit", StringComparison.OrdinalIgnoreCase))
                 {
                     await _client.DisconnectAsync().ConfigureAwait(false);
