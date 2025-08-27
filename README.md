@@ -74,11 +74,11 @@ servers and clients with optional TLS (for TCP) and optional application-layer e
                 {
                     Protocol = ProtocolType.TCP,
                     Port = 1111,
-                    UseSsl = false,
+                    UseSsl = true,
                     UseAesEncryption = true,
                     MaxConnections = 100000,
                     AesPassword = "EonaCat.Connections.Password",
-                    //Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("server.pfx", "p@ss")
+                    Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("server.pfx", "p@ss")
                 };
 
                 _server = new NetworkServer(config);
@@ -131,9 +131,7 @@ servers and clients with optional TLS (for TCP) and optional application-layer e
 
 ## Client example:
 
-	using EonaCat.Connections;
-    using EonaCat.Connections.Models;
-    using System.Text;
+	using EonaCat.Connections.Models;
 
     namespace EonaCat.Connections.Client.Example
     {
@@ -150,8 +148,15 @@ servers and clients with optional TLS (for TCP) and optional application-layer e
 
                 while (true)
                 {
+                    if (!_client.IsConnected)
+                    {
+                        await Task.Delay(1000).ConfigureAwait(false);
+                        continue;
+                    }
+
                     Console.Write("Enter message to send (or 'exit' to quit): ");
                     var message = Console.ReadLine();
+
                     if (!string.IsNullOrEmpty(message) && message.Equals("exit", StringComparison.OrdinalIgnoreCase))
                     {
                         await _client.DisconnectAsync().ConfigureAwait(false);
@@ -172,18 +177,27 @@ servers and clients with optional TLS (for TCP) and optional application-layer e
                     Protocol = ProtocolType.TCP,
                     Host = "127.0.0.1",
                     Port = 1111,
-                    UseSsl = false,
+                    UseSsl = true,
                     UseAesEncryption = true,
                     AesPassword = "EonaCat.Connections.Password",
-                    //Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("client.pfx", "p@ss"),
+                    Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("client.pfx", "p@ss"),
                 };
 
                 _client = new NetworkClient(config);
 
+                _client.OnGeneralError += (sender, e) =>
+                    Console.WriteLine($"Error: {e.Message}");
+
                 // Subscribe to events
-                _client.OnConnected += (sender, e) =>
+                _client.OnConnected += async (sender, e) =>
                 {
                     Console.WriteLine($"Connected to server at {e.RemoteEndPoint}");
+
+                    // Set nickname
+                    await _client.SetNicknameAsync("TestUser");
+
+                    // Send a message
+                    await _client.SendAsync("Hello server!");
                 };
 
                 _client.OnDataReceived += (sender, e) =>
@@ -194,13 +208,8 @@ servers and clients with optional TLS (for TCP) and optional application-layer e
                     Console.WriteLine("Disconnected from server");
                 };
 
+                Console.WriteLine("Connecting to server...");
                 await _client.ConnectAsync();
-
-                // Send nickname
-                await _client.SendNicknameAsync("TestUser");
-
-                // Send a message
-                await _client.SendAsync("Hello server!");
             }
         }
-}
+    }

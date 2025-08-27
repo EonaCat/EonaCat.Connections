@@ -6,6 +6,7 @@
     public class ErrorEventArgs : EventArgs
     {
         public string ClientId { get; set; }
+        public string Nickname { get; set; }
         public Exception Exception { get; set; }
         public string Message { get; set; }
         public DateTime Timestamp { get; set; } = DateTime.UtcNow;

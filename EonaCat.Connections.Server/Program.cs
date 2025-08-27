@@ -38,11 +38,11 @@ namespace EonaCat.Connections.Server.Example
             {
                 Protocol = ProtocolType.TCP,
                 Port = 1111,
-                UseSsl = false,
+                UseSsl = true,
                 UseAesEncryption = true,
                 MaxConnections = 100000,
                 AesPassword = "EonaCat.Connections.Password",
-                //Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("server.pfx", "p@ss")
+                Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("server.pfx", "p@ss")
             };
 
             _server = new NetworkServer(config);

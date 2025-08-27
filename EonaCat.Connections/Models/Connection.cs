@@ -48,5 +48,6 @@ namespace EonaCat.Connections.Models
         public CancellationTokenSource CancellationToken { get; set; }
         public long BytesSent { get; set; }
         public long BytesReceived { get; set; }
+        public SemaphoreSlim SendLock { get; internal set; }
     }
 }

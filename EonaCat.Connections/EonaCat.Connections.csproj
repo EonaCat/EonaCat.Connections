@@ -11,7 +11,7 @@
     <Copyright>EonaCat (Jeroen Saey)</Copyright>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
     <PackageId>EonaCat.Connections</PackageId>
-    <Version>1.0.6</Version>
+    <Version>1.0.7</Version>
     <Authors>EonaCat (Jeroen Saey)</Authors>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageIcon>EonaCat.png</PackageIcon>

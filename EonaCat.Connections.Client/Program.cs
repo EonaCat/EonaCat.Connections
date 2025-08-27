@@ -44,10 +44,10 @@ namespace EonaCat.Connections.Client.Example
                 Protocol = ProtocolType.TCP,
                 Host = "127.0.0.1",
                 Port = 1111,
-                UseSsl = false,
+                UseSsl = true,
                 UseAesEncryption = true,
                 AesPassword = "EonaCat.Connections.Password",
-                //Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("client.pfx", "p@ss"),
+                Certificate = new System.Security.Cryptography.X509Certificates.X509Certificate2("client.pfx", "p@ss"),
             };
 
             _client = new NetworkClient(config);
@@ -60,8 +60,8 @@ namespace EonaCat.Connections.Client.Example
             {
                 Console.WriteLine($"Connected to server at {e.RemoteEndPoint}");
 
-                // Send nickname
-                await _client.SendNicknameAsync("TestUser");
+                // Set nickname
+                await _client.SetNicknameAsync("TestUser");
 
                 // Send a message
                 await _client.SendAsync("Hello server!");

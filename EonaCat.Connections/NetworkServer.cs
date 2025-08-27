@@ -12,9 +12,6 @@ using ErrorEventArgs = EonaCat.Connections.EventArguments.ErrorEventArgs;
 
 namespace EonaCat.Connections
 {
-    // This file is part of the EonaCat project(s) which is released under the Apache License.
-    // See the LICENSE file or go to https://EonaCat.com/license for full license details.
-
     public class NetworkServer : IDisposable
     {
         private readonly Configuration _config;
@@ -24,6 +21,13 @@ namespace EonaCat.Connections
         private UdpClient _udpListener;
         private CancellationTokenSource _serverCancellation;
         private readonly object _statsLock = new object();
+        private readonly object _serverLock = new object();
+
+        private readonly ConcurrentDictionary<string, ConcurrentBag<string>> _rooms = new();
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _roomHistory = new();
+        private readonly ConcurrentDictionary<string, string> _roomPasswords = new();
+        private readonly ConcurrentDictionary<string, (int Count, DateTime Timestamp)> _rateLimits = new();
+        private readonly int _maxMessagesPerSecond = 10;
 
         public event EventHandler<ConnectionEventArgs> OnConnected;
         public event EventHandler<ConnectionEventArgs> OnConnectedWithNickname;
@@ -54,23 +58,47 @@ namespace EonaCat.Connections
 
         public async Task StartAsync()
         {
-            _serverCancellation?.Cancel();
-            _serverCancellation = new CancellationTokenSource();
+            lock (_serverLock)
+            {
+                if (_serverCancellation != null && !_serverCancellation.IsCancellationRequested)
+                {
+                    // Server is already running
+                    return;
+                }
 
-            if (_config.Protocol == ProtocolType.TCP)
-            {
-                await StartTcpServerAsync();
+                _serverCancellation = new CancellationTokenSource();
             }
-            else
+
+            try
             {
-                await StartUdpServerAsync();
+                if (_config.Protocol == ProtocolType.TCP)
+                {
+                    await StartTcpServerAsync();
+                }
+                else
+                {
+                    await StartUdpServerAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error starting server" });
             }
         }
 
         private async Task StartTcpServerAsync()
         {
-            _tcpListener = new TcpListener(IPAddress.Parse(_config.Host), _config.Port);
-            _tcpListener.Start();
+            lock (_serverLock)
+            {
+                if (_tcpListener != null)
+                {
+                    _tcpListener.Stop();
+                }
+
+                _tcpListener = new TcpListener(IPAddress.Parse(_config.Host), _config.Port);
+                _tcpListener.Start();
+            }
+
             Console.WriteLine($"TCP Server started on {_config.Host}:{_config.Port}");
 
             while (!_serverCancellation.Token.IsCancellationRequested)
@@ -88,10 +116,54 @@ namespace EonaCat.Connections
             }
         }
 
+
+        private readonly TimeSpan _udpCleanupInterval = TimeSpan.FromMinutes(1);
+
+        private async Task CleanupInactiveUdpClientsAsync()
+        {
+            while (!_serverCancellation.Token.IsCancellationRequested)
+            {
+                var now = DateTime.UtcNow;
+                foreach (var kvp in _clients.ToArray())
+                {
+                    var client = kvp.Value;
+                    if (client.TcpClient == null && (now - client.LastActive) > TimeSpan.FromMinutes(5))
+                    {
+                        DisconnectClient(client.Id);
+                    }
+                }
+                await Task.Delay(_udpCleanupInterval, _serverCancellation.Token);
+            }
+        }
+
+        private bool CheckRateLimit(string clientId)
+        {
+            var now = DateTime.UtcNow;
+
+            _rateLimits.TryGetValue(clientId, out var record);
+            if ((now - record.Timestamp).TotalSeconds > 1)
+            {
+                record = (0, now);
+            }
+
+            record.Count++;
+            _rateLimits[clientId] = record;
+
+            return record.Count <= _maxMessagesPerSecond;
+        }
+
+
+
         private async Task StartUdpServerAsync()
         {
-            _udpListener = new UdpClient(_config.Port);
+            lock (_serverLock)
+            {
+                _udpListener?.Close();
+                _udpListener = new UdpClient(_config.Port);
+            }
+
             Console.WriteLine($"UDP Server started on {_config.Host}:{_config.Port}");
+            _ = Task.Run(() => CleanupInactiveUdpClientsAsync(), _serverCancellation.Token);
 
             while (!_serverCancellation.Token.IsCancellationRequested)
             {
@@ -100,13 +172,17 @@ namespace EonaCat.Connections
                     var result = await _udpListener.ReceiveAsync();
                     _ = Task.Run(() => HandleUdpDataAsync(result), _serverCancellation.Token);
                 }
-                catch (ObjectDisposedException) { break; }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
                 catch (Exception ex)
                 {
                     OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving UDP data" });
                 }
             }
         }
+
 
         private async Task HandleTcpClientAsync(TcpClient tcpClient)
         {
@@ -118,7 +194,8 @@ namespace EonaCat.Connections
                 RemoteEndPoint = (IPEndPoint)tcpClient.Client.RemoteEndPoint,
                 ConnectedAt = DateTime.UtcNow,
                 LastActive = DateTime.UtcNow,
-                CancellationToken = new CancellationTokenSource()
+                CancellationToken = new CancellationTokenSource(),
+                SendLock = new SemaphoreSlim(1, 1)
             };
 
             try
@@ -147,7 +224,8 @@ namespace EonaCat.Connections
                     }
                     catch (Exception ex)
                     {
-                        OnSslError?.Invoke(this, new ErrorEventArgs { ClientId = clientId, Exception = ex, Message = "SSL authentication failed" });
+                        var handler = OnSslError;
+                        handler?.Invoke(this, new ErrorEventArgs { ClientId = clientId, Exception = ex, Message = "SSL authentication failed" });
                         return;
                     }
                 }
@@ -156,7 +234,6 @@ namespace EonaCat.Connections
                 {
                     try
                     {
-                        // Create AES object
                         client.AesEncryption = Aes.Create();
                         client.AesEncryption.KeySize = 256;
                         client.AesEncryption.BlockSize = 128;
@@ -164,17 +241,12 @@ namespace EonaCat.Connections
                         client.AesEncryption.Padding = PaddingMode.PKCS7;
                         client.IsEncrypted = true;
 
-                        // Send salt to client to derive key
                         await AesKeyExchange.SendAesKeyAsync(stream, client.AesEncryption, _config.AesPassword);
                     }
                     catch (Exception ex)
                     {
-                        OnEncryptionError?.Invoke(this, new ErrorEventArgs
-                        {
-                            ClientId = clientId,
-                            Exception = ex,
-                            Message = "AES setup failed"
-                        });
+                        var handler = OnEncryptionError;
+                        handler?.Invoke(this, new ErrorEventArgs { ClientId = clientId, Exception = ex, Message = "AES setup failed" });
                         return;
                     }
                 }
@@ -184,21 +256,21 @@ namespace EonaCat.Connections
 
                 lock (_statsLock) { _stats.TotalConnections++; }
 
-                OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = clientId, RemoteEndPoint = client.RemoteEndPoint });
+                var connectedHandler = OnConnected;
+                connectedHandler?.Invoke(this, new ConnectionEventArgs { ClientId = clientId, RemoteEndPoint = client.RemoteEndPoint });
 
                 await HandleClientCommunicationAsync(client);
             }
             catch (Exception ex)
             {
-                OnGeneralError?.Invoke(this, new ErrorEventArgs { ClientId = clientId, Exception = ex, Message = "Error handling TCP client" });
+                var handler = OnGeneralError;
+                handler?.Invoke(this, new ErrorEventArgs { ClientId = clientId, Exception = ex, Message = "Error handling TCP client" });
             }
             finally
             {
                 DisconnectClient(clientId);
             }
         }
-
-
 
         private async Task HandleUdpDataAsync(UdpReceiveResult result)
         {
@@ -209,11 +281,15 @@ namespace EonaCat.Connections
                 {
                     Id = clientKey,
                     RemoteEndPoint = result.RemoteEndPoint,
-                    ConnectedAt = DateTime.UtcNow
+                    ConnectedAt = DateTime.UtcNow,
+                    SendLock = new SemaphoreSlim(1, 1)
                 };
                 _clients[clientKey] = client;
+
                 lock (_statsLock) { _stats.TotalConnections++; }
-                OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = clientKey, RemoteEndPoint = result.RemoteEndPoint });
+
+                var handler = OnConnected;
+                handler?.Invoke(this, new ConnectionEventArgs { ClientId = clientKey, RemoteEndPoint = result.RemoteEndPoint });
             }
 
             await ProcessReceivedDataAsync(client, result.Buffer);
@@ -269,7 +345,8 @@ namespace EonaCat.Connections
                 }
                 catch (Exception ex)
                 {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error reading from client" });
+                    var handler = OnGeneralError;
+                    handler?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error reading from client" });
                     break;
                 }
             }
@@ -295,6 +372,13 @@ namespace EonaCat.Connections
         {
             try
             {
+                if (!CheckRateLimit(client.Id))
+                {
+                    // Throttle the client
+                    await Task.Delay(100);
+                    return;
+                }
+
                 client.BytesReceived += data.Length;
                 lock (_statsLock)
                 {
@@ -316,7 +400,13 @@ namespace EonaCat.Connections
                     if (stringData.StartsWith("NICKNAME:"))
                     {
                         client.Nickname = stringData.Substring(9);
-                        OnConnectedWithNickname?.Invoke(this, new ConnectionEventArgs { ClientId = client.Id, RemoteEndPoint = client.RemoteEndPoint, Nickname = client.Nickname });
+                        var handler = OnConnectedWithNickname;
+                        handler?.Invoke(this, new ConnectionEventArgs
+                        {
+                            ClientId = client.Id,
+                            RemoteEndPoint = client.RemoteEndPoint,
+                            Nickname = client.Nickname
+                        });
                         return;
                     }
                     else if (stringData.Equals("DISCONNECT", StringComparison.OrdinalIgnoreCase))
@@ -324,10 +414,61 @@ namespace EonaCat.Connections
                         DisconnectClient(client.Id);
                         return;
                     }
+                    else if (stringData.StartsWith("JOIN_ROOM:"))
+                    {
+                        string roomName = stringData.Substring(10);
+                        var bag = _rooms.GetOrAdd(roomName, _ => new ConcurrentBag<string>());
+                        if (!bag.Contains(client.Id))
+                        {
+                            bag.Add(client.Id);
+                        }
+
+                        return;
+                    }
+                    else if (stringData.StartsWith("LEAVE_ROOM:"))
+                    {
+                        string roomName = stringData.Substring(11);
+                        if (_rooms.TryGetValue(roomName, out var bag))
+                        {
+                            _rooms[roomName] = new ConcurrentBag<string>(bag.Where(id => id != client.Id));
+                        }
+                        return;
+                    }
+                    else if (stringData.StartsWith("ROOM_MSG:"))
+                    {
+                        var parts = stringData.Substring(9).Split(new[] { ":" }, 2, StringSplitOptions.None);
+                        if (parts.Length == 2)
+                        {
+                            string roomName = parts[0];
+                            string msg = parts[1];
+
+                            if (_rooms.TryGetValue(roomName, out var clients))
+                            {
+                                // Broadcast to room
+                                var tasks = clients.Where(id => _clients.ContainsKey(id))
+                                                   .Select(id => SendDataAsync(_clients[id], Encoding.UTF8.GetBytes($"{client.Nickname}:{msg}")));
+                                await Task.WhenAll(tasks);
+
+                                // Add to room history
+                                var history = _roomHistory.GetOrAdd(roomName, _ => new ConcurrentQueue<string>());
+                                history.Enqueue($"{client.Nickname}:{msg}");
+                                while (history.Count > 100)
+                                {
+                                    history.TryDequeue(out _);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    else
+                    {
+                        await HandleCommand(client, stringData);
+                    }
                 }
 
                 client.LastActive = DateTime.UtcNow;
-                OnDataReceived?.Invoke(this, new DataReceivedEventArgs
+                var dataHandler = OnDataReceived;
+                dataHandler?.Invoke(this, new DataReceivedEventArgs
                 {
                     ClientId = client.Id,
                     Nickname = client.Nickname,
@@ -340,20 +481,18 @@ namespace EonaCat.Connections
             catch (Exception ex)
             {
                 var handler = client.IsEncrypted ? OnEncryptionError : OnGeneralError;
-                handler?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error processing data" });
+                handler?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error processing data", Nickname = client.Nickname });
             }
         }
 
         private async Task SendDataAsync(Connection client, byte[] data)
         {
+            await client.SendLock.WaitAsync();
             try
             {
-                // Encrypt if AES is enabled
                 if (client.IsEncrypted && client.AesEncryption != null)
                 {
                     data = await AesCryptoHelpers.EncryptDataAsync(data, client.AesEncryption);
-
-                    // Prepend 4-byte length (big-endian) for framing
                     var lengthPrefix = BitConverter.GetBytes(data.Length);
                     if (BitConverter.IsLittleEndian)
                     {
@@ -377,7 +516,6 @@ namespace EonaCat.Connections
                     await _udpListener.SendAsync(data, data.Length, client.RemoteEndPoint);
                 }
 
-                // Update stats
                 client.BytesSent += data.Length;
                 lock (_statsLock)
                 {
@@ -388,13 +526,86 @@ namespace EonaCat.Connections
             catch (Exception ex)
             {
                 var handler = client.IsEncrypted ? OnEncryptionError : OnGeneralError;
-                handler?.Invoke(this, new ErrorEventArgs
-                {
-                    ClientId = client.Id,
-                    Exception = ex,
-                    Message = "Error sending data"
-                });
+                handler?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error sending data", Nickname = client.Nickname });
             }
+            finally
+            {
+                client.SendLock.Release();
+            }
+        }
+
+        public async Task SendFileAsync(Connection client, byte[] fileData, int chunkSize = 8192)
+        {
+            int offset = 0;
+            while (offset < fileData.Length)
+            {
+                int size = Math.Min(chunkSize, fileData.Length - offset);
+                var chunk = new byte[size];
+                Array.Copy(fileData, offset, chunk, 0, size);
+                await SendDataAsync(client, chunk);
+                offset += size;
+            }
+        }
+
+        public void AddMessageToRoomHistory(string roomName, string message)
+        {
+            var queue = _roomHistory.GetOrAdd(roomName, _ => new ConcurrentQueue<string>());
+            queue.Enqueue(message);
+            if (queue.Count > 100)
+            {
+                queue.TryDequeue(out _);
+            }
+        }
+
+        public bool SetRoomPassword(string roomName, string password)
+        {
+            _roomPasswords[roomName] = password;
+            return true;
+        }
+
+        public bool JoinRoomWithPassword(string clientId, string roomName, string password)
+        {
+            if (_roomPasswords.TryGetValue(roomName, out var storedPassword) && storedPassword == password)
+            {
+                JoinRoom(clientId, roomName);
+                return true;
+            }
+            return false;
+        }
+
+
+        public IEnumerable<string> GetRoomHistory(string roomName)
+        {
+            if (_roomHistory.TryGetValue(roomName, out var queue))
+            {
+                return queue.ToArray();
+            }
+
+            return Enumerable.Empty<string>();
+        }
+
+        public async Task SendPrivateMessageAsync(string fromNickname, string toNickname, string message)
+        {
+            var tasks = _clients.Values
+                .Where(c => !string.IsNullOrEmpty(c.Nickname) && c.Nickname.Equals(toNickname, StringComparison.OrdinalIgnoreCase))
+                .Select(c => SendDataAsync(c, Encoding.UTF8.GetBytes($"[PM from {fromNickname}]: {message}")))
+                .ToArray();
+            await Task.WhenAll(tasks);
+        }
+
+
+        public void GetAllClients(out List<Connection> clients)
+        {
+            clients = _clients.Values.ToList();
+        }
+
+        public Connection GetClientById(string clientId)
+        {
+            if (_clients.TryGetValue(clientId, out var client))
+            {
+                return client;
+            }
+            return _clients.Values.FirstOrDefault(c => c.Nickname != null && c.Nickname.Equals(clientId, StringComparison.OrdinalIgnoreCase));
         }
 
         public async Task SendToClientAsync(string clientId, byte[] data)
@@ -405,7 +616,6 @@ namespace EonaCat.Connections
                 return;
             }
 
-            // Fallback: try nickname
             foreach (var kvp in _clients)
             {
                 if (kvp.Value.Nickname != null && kvp.Value.Nickname.Equals(clientId, StringComparison.OrdinalIgnoreCase))
@@ -438,29 +648,139 @@ namespace EonaCat.Connections
             {
                 try
                 {
+                    CleanupClientFromRooms(clientId);
+
                     client.CancellationToken?.Cancel();
                     client.TcpClient?.Close();
                     client.Stream?.Dispose();
                     client.AesEncryption?.Dispose();
 
-                    OnDisconnected?.Invoke(this, new ConnectionEventArgs { ClientId = client.Id, RemoteEndPoint = client.RemoteEndPoint, Nickname = client.Nickname });
+                    foreach (var room in _rooms.Keys.ToList())
+                    {
+                        if (_rooms.TryGetValue(room, out var bag))
+                        {
+                            _rooms[room] = new ConcurrentBag<string>(bag.Where(id => id != clientId));
+                        }
+                    }
+
+                    var handler = OnDisconnected;
+                    handler?.Invoke(this, new ConnectionEventArgs { ClientId = client.Id, RemoteEndPoint = client.RemoteEndPoint, Nickname = client.Nickname });
                 }
                 catch (Exception ex)
                 {
-                    OnGeneralError?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error disconnecting client" });
+                    var handler = OnGeneralError;
+                    handler?.Invoke(this, new ErrorEventArgs { ClientId = client.Id, Exception = ex, Message = "Error disconnecting client", Nickname = client.Nickname });
                 }
             }
         }
 
+        public void JoinRoom(string clientId, string roomName)
+        {
+            var bag = _rooms.GetOrAdd(roomName, _ => new ConcurrentBag<string>());
+            bag.Add(clientId);
+        }
+
+        public void LeaveRoom(string clientId, string roomName)
+        {
+            if (_rooms.TryGetValue(roomName, out var bag))
+            {
+                var newBag = new ConcurrentBag<string>(bag.Where(id => id != clientId));
+                _rooms[roomName] = newBag;
+            }
+        }
+
+        public async Task BroadcastToNicknameAsync(string nickname, byte[] data)
+        {
+            var tasks = _clients.Values
+                .Where(c => !string.IsNullOrEmpty(c.Nickname) && c.Nickname.Equals(nickname, StringComparison.OrdinalIgnoreCase))
+                .Select(c => SendDataAsync(c, data))
+                .ToArray();
+            await Task.WhenAll(tasks);
+        }
+
+        public async Task BroadcastToNicknameAsync(string nickname, string message)
+        {
+            await BroadcastToNicknameAsync(nickname, Encoding.UTF8.GetBytes(message));
+        }
+
+        public async Task BroadcastToRoomAsync(string roomName, byte[] data)
+        {
+            if (!_rooms.TryGetValue(roomName, out var clients))
+            {
+                return;
+            }
+
+            var tasks = clients.Where(id => _clients.ContainsKey(id))
+                               .Select(id => SendDataAsync(_clients[id], data))
+                               .ToArray();
+            await Task.WhenAll(tasks);
+        }
+
+        public async Task BroadcastToRoomExceptAsync(string roomName, byte[] data, string exceptClientId)
+        {
+            if (!_rooms.TryGetValue(roomName, out var clients))
+            {
+                return;
+            }
+
+            var tasks = clients
+                .Where(id => _clients.ContainsKey(id) && id != exceptClientId)
+                .Select(id => SendDataAsync(_clients[id], data))
+                .ToArray();
+
+            await Task.WhenAll(tasks);
+        }
+
+        private readonly ConcurrentDictionary<string, Func<Connection, string, Task>> _commands = new();
+
+        public void RegisterCommand(string command, Func<Connection, string, Task> handler)
+        {
+            _commands[command] = handler;
+        }
+
+        private async Task HandleCommand(Connection client, string commandLine)
+        {
+            if (string.IsNullOrWhiteSpace(commandLine))
+            {
+                return;
+            }
+
+            var parts = commandLine.Split(' ');
+            var cmd = parts[0].ToUpperInvariant();
+            var args = parts.Length > 1 ? parts[1] : string.Empty;
+
+            if (_commands.TryGetValue(cmd, out var handler))
+            {
+                await handler(client, args);
+            }
+        }
+
+
+        public async Task BroadcastToRoomAsync(string roomName, string message)
+        {
+            await BroadcastToRoomAsync(roomName, Encoding.UTF8.GetBytes(message));
+        }
+
         public void Stop()
         {
-            _serverCancellation?.Cancel();
-            _tcpListener?.Stop();
-            _udpListener?.Close();
+            lock (_serverLock)
+            {
+                _serverCancellation?.Cancel();
+                _tcpListener?.Stop();
+                _udpListener?.Close();
+            }
 
             foreach (var clientId in _clients.Keys.ToArray())
             {
                 DisconnectClient(clientId);
+            }
+        }
+
+        private void CleanupClientFromRooms(string clientId)
+        {
+            foreach (var room in _rooms.Keys.ToList())
+            {
+                LeaveRoom(clientId, room);
             }
         }
 

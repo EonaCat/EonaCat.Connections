@@ -11,9 +11,6 @@ using ErrorEventArgs = EonaCat.Connections.EventArguments.ErrorEventArgs;
 
 namespace EonaCat.Connections
 {
-    // This file is part of the EonaCat project(s) which is released under the Apache License.
-    // See the LICENSE file or go to https://EonaCat.com/license for full license details.
-
     public class NetworkClient : IDisposable
     {
         private readonly Configuration _config;
@@ -24,7 +21,25 @@ namespace EonaCat.Connections
         private CancellationTokenSource _cancellation;
         private bool _isConnected;
 
-        public bool IsConnected => _isConnected;
+        private readonly object _stateLock = new object();
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
+
+        private readonly HashSet<string> _joinedRooms = new();
+
+        public bool IsConnected
+        {
+            get { lock (_stateLock)
+                {
+                    return _isConnected;
+                }
+            }
+            private set { lock (_stateLock)
+                {
+                    _isConnected = value;
+                }
+            }
+        }
+
         public bool IsAutoReconnecting { get; private set; }
 
         public event EventHandler<ConnectionEventArgs> OnConnected;
@@ -41,8 +56,11 @@ namespace EonaCat.Connections
 
         public async Task ConnectAsync()
         {
-            _cancellation?.Cancel();
-            _cancellation = new CancellationTokenSource();
+            lock (_stateLock)
+            {
+                _cancellation?.Cancel();
+                _cancellation = new CancellationTokenSource();
+            }
 
             if (_config.Protocol == ProtocolType.TCP)
             {
@@ -58,10 +76,10 @@ namespace EonaCat.Connections
         {
             try
             {
-                _tcpClient = new TcpClient();
-                await _tcpClient.ConnectAsync(_config.Host, _config.Port);
+                var client = new TcpClient();
+                await client.ConnectAsync(_config.Host, _config.Port);
 
-                Stream stream = _tcpClient.GetStream();
+                Stream stream = client.GetStream();
 
                 if (_config.UseSsl)
                 {
@@ -99,8 +117,12 @@ namespace EonaCat.Connections
                     }
                 }
 
-                _stream = stream;
-                _isConnected = true;
+                lock (_stateLock)
+                {
+                    _tcpClient = client;
+                    _stream = stream;
+                    IsConnected = true;
+                }
 
                 OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self", RemoteEndPoint = new IPEndPoint(IPAddress.Parse(_config.Host), _config.Port) });
 
@@ -108,7 +130,7 @@ namespace EonaCat.Connections
             }
             catch (Exception ex)
             {
-                _isConnected = false;
+                IsConnected = false;
                 OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Failed to connect" });
                 _ = Task.Run(() => AutoReconnectAsync());
             }
@@ -118,9 +140,14 @@ namespace EonaCat.Connections
         {
             try
             {
-                _udpClient = new UdpClient();
-                _udpClient.Connect(_config.Host, _config.Port);
-                _isConnected = true;
+                var client = new UdpClient();
+                client.Connect(_config.Host, _config.Port);
+
+                lock (_stateLock)
+                {
+                    _udpClient = client;
+                    IsConnected = true;
+                }
 
                 OnConnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self", RemoteEndPoint = new IPEndPoint(IPAddress.Parse(_config.Host), _config.Port) });
 
@@ -128,14 +155,14 @@ namespace EonaCat.Connections
             }
             catch (Exception ex)
             {
-                _isConnected = false;
+                IsConnected = false;
                 OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Failed to connect UDP" });
             }
         }
 
         private async Task ReceiveDataAsync(CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested && _isConnected)
+            while (!ct.IsCancellationRequested && IsConnected)
             {
                 try
                 {
@@ -182,7 +209,7 @@ namespace EonaCat.Connections
                 }
                 catch (Exception ex)
                 {
-                    _isConnected = false;
+                    IsConnected = false;
                     OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving data" });
                     _ = Task.Run(() => AutoReconnectAsync());
                     break;
@@ -210,7 +237,7 @@ namespace EonaCat.Connections
 
         private async Task ReceiveUdpDataAsync(CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested && _isConnected)
+            while (!ct.IsCancellationRequested && IsConnected)
             {
                 try
                 {
@@ -220,7 +247,7 @@ namespace EonaCat.Connections
                 catch (Exception ex)
                 {
                     OnGeneralError?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error receiving UDP data" });
-                    _isConnected = false;
+                    IsConnected = false;
                     _ = Task.Run(() => AutoReconnectAsync());
                     break;
                 }
@@ -258,11 +285,12 @@ namespace EonaCat.Connections
 
         public async Task SendAsync(byte[] data)
         {
-            if (!_isConnected)
+            if (!IsConnected)
             {
                 return;
             }
 
+            await _sendLock.WaitAsync();
             try
             {
                 if (_config.UseAesEncryption && _aesEncryption != null)
@@ -296,10 +324,52 @@ namespace EonaCat.Connections
                 var handler = _config.UseAesEncryption ? OnEncryptionError : OnGeneralError;
                 handler?.Invoke(this, new ErrorEventArgs { Exception = ex, Message = "Error sending data" });
             }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        /// <summary>Join a room (server should recognize this command)</summary>
+        public async Task JoinRoomAsync(string roomName)
+        {
+            if (string.IsNullOrWhiteSpace(roomName) || _joinedRooms.Contains(roomName))
+            {
+                return;
+            }
+
+            _joinedRooms.Add(roomName);
+            await SendAsync($"JOIN_ROOM:{roomName}");
+        }
+
+        public async Task LeaveRoomAsync(string roomName)
+        {
+            if (string.IsNullOrWhiteSpace(roomName) || !_joinedRooms.Contains(roomName))
+            {
+                return;
+            }
+
+            _joinedRooms.Remove(roomName);
+            await SendAsync($"LEAVE_ROOM:{roomName}");
+        }
+
+        public async Task SendToRoomAsync(string roomName, string message)
+        {
+            if (string.IsNullOrWhiteSpace(roomName) || !_joinedRooms.Contains(roomName))
+            {
+                return;
+            }
+
+            await SendAsync($"ROOM_MSG:{roomName}:{message}");
+        }
+
+        public IReadOnlyCollection<string> GetJoinedRooms()
+        {
+            return _joinedRooms.ToList().AsReadOnly();
         }
 
         public async Task SendAsync(string message) => await SendAsync(Encoding.UTF8.GetBytes(message));
-        public async Task SendNicknameAsync(string nickname) => await SendAsync($"NICKNAME:{nickname}");
+        private async Task SendNicknameAsync(string nickname) => await SendAsync($"NICKNAME:{nickname}");
 
         private async Task AutoReconnectAsync()
         {
@@ -309,18 +379,17 @@ namespace EonaCat.Connections
             }
 
             int attempt = 0;
+            IsAutoReconnecting = true;
 
-            while (!_isConnected && (_config.MaxReconnectAttempts == 0 || attempt < _config.MaxReconnectAttempts))
+            while (!IsConnected && (_config.MaxReconnectAttempts == 0 || attempt < _config.MaxReconnectAttempts))
             {
                 attempt++;
                 try
                 {
-                    IsAutoReconnecting = true;
                     OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Reconnecting attempt {attempt}" });
                     await ConnectAsync();
-                    if (_isConnected)
+                    if (IsConnected)
                     {
-                        IsAutoReconnecting = false;
                         OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = $"Reconnected after {attempt} attempt(s)" });
                         break;
                     }
@@ -330,22 +399,43 @@ namespace EonaCat.Connections
                 await Task.Delay(_config.ReconnectDelayMs);
             }
 
-            if (!_isConnected)
+            if (!IsConnected)
             {
                 OnGeneralError?.Invoke(this, new ErrorEventArgs { Message = "Failed to reconnect" });
             }
+
+            IsAutoReconnecting = false;
         }
+
+        private string _nickname;
+        public async Task SetNicknameAsync(string nickname)
+        {
+            _nickname = nickname;
+            await SendNicknameAsync(nickname);
+        }
+
+        public string Nickname => _nickname;
+
 
         public async Task DisconnectAsync()
         {
-            _isConnected = false;
-            _cancellation?.Cancel();
+            lock (_stateLock)
+            {
+                if (!IsConnected)
+                {
+                    return;
+                }
+
+                IsConnected = false;
+                _cancellation?.Cancel();
+            }
 
             _tcpClient?.Close();
             _udpClient?.Close();
             _stream?.Dispose();
             _aesEncryption?.Dispose();
-
+            _joinedRooms?.Clear();
+            
             OnDisconnected?.Invoke(this, new ConnectionEventArgs { ClientId = "self" });
         }
 
@@ -354,6 +444,7 @@ namespace EonaCat.Connections
             _cancellation?.Cancel();
             DisconnectAsync().Wait();
             _cancellation?.Dispose();
+            _sendLock.Dispose();
         }
     }
 }
