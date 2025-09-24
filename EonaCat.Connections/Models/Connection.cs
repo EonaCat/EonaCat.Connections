@@ -14,9 +14,9 @@ namespace EonaCat.Connections.Models
         public UdpClient UdpClient { get; set; }
         public IPEndPoint RemoteEndPoint { get; set; }
         public Stream Stream { get; set; }
-        
+
         private string _nickName;
-        public string Nickname 
+        public string Nickname
         {
             get
             {
@@ -40,14 +40,26 @@ namespace EonaCat.Connections.Models
             }
         }
 
+        public bool HasNickname => !string.IsNullOrWhiteSpace(_nickName) && _nickName != Id;
+
         public DateTime ConnectedAt { get; set; }
         public DateTime LastActive { get; set; }
         public bool IsSecure { get; set; }
         public bool IsEncrypted { get; set; }
         public Aes AesEncryption { get; set; }
         public CancellationTokenSource CancellationToken { get; set; }
-        public long BytesSent { get; set; }
-        public long BytesReceived { get; set; }
-        public SemaphoreSlim SendLock { get; internal set; }
+        private long _bytesReceived;
+        private long _bytesSent;
+        public long BytesReceived => Interlocked.Read(ref _bytesReceived);
+        public long BytesSent => Interlocked.Read(ref _bytesSent);
+
+        public void AddBytesReceived(long count) => Interlocked.Add(ref _bytesReceived, count);
+        public void AddBytesSent(long count) => Interlocked.Add(ref _bytesSent, count);
+
+        public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1);
+        public SemaphoreSlim ReadLock { get; } = new SemaphoreSlim(1, 1);
+
+        private int _disconnected;
+        public bool MarkDisconnected() => Interlocked.Exchange(ref _disconnected, 1) == 0;
     }
 }

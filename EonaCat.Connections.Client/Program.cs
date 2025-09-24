@@ -61,7 +61,7 @@ namespace EonaCat.Connections.Client.Example
                 Console.WriteLine($"Connected to server at {e.RemoteEndPoint}");
 
                 // Set nickname
-                await _client.SetNicknameAsync("TestUser");
+                await _client.SendNicknameAsync("TestUser");
 
                 // Send a message
                 await _client.SendAsync("Hello server!");

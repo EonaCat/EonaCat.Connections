@@ -7,6 +7,9 @@ using Timer = System.Timers.Timer;
 
 namespace EonaCat.Connections.Processors
 {
+    // This file is part of the EonaCat project(s) which is released under the Apache License.
+    // See the LICENSE file or go to https://EonaCat.com/license for full license details.
+
     /// <summary>
     /// Processes incoming data streams into JSON or text messages per client buffer.
     /// </summary>

@@ -11,7 +11,7 @@
     <Copyright>EonaCat (Jeroen Saey)</Copyright>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
     <PackageId>EonaCat.Connections</PackageId>
-    <Version>1.0.7</Version>
+    <Version>1.0.8</Version>
     <Authors>EonaCat (Jeroen Saey)</Authors>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageIcon>EonaCat.png</PackageIcon>
@@ -36,6 +36,7 @@
 
   <ItemGroup>
     <PackageReference Include="EonaCat.Json" Version="1.1.9" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.6.3" />
   </ItemGroup>
 
 </Project>
